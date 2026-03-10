@@ -68,7 +68,7 @@ class VoiceSessionHandler:
         """Start the Voice Live session."""
         try:
             self.is_running = True
-            model = self.config.get("model", os.getenv("VOICELIVE_MODEL", "gpt-realtime"))
+            model = self.config.get("model", os.getenv("VOICELIVE_MODEL", "gpt-realtime-1.5"))
             mode = self.config.get("mode", "model")
 
             # Build connection model string based on mode
@@ -114,7 +114,7 @@ class VoiceSessionHandler:
         """Configure the Voice Live session with avatar, voice, and other settings."""
         config = self.config
         mode = config.get("mode", "model")
-        model = config.get("model", "gpt-realtime")
+        model = config.get("model", "gpt-realtime-1.5")
 
         # Build voice configuration
         voice_config = self._build_voice_config(config)

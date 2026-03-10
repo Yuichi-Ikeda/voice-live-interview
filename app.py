@@ -119,7 +119,7 @@ async def get_config():
         with open(prompt_path, "r", encoding="utf-8") as f:
             instructions = f.read()
     return {
-        "model": os.getenv("VOICELIVE_MODEL", "gpt-realtime"),
+        "model": os.getenv("VOICELIVE_MODEL", "gpt-realtime-1.5"),
         "voice": os.getenv("VOICELIVE_VOICE", "ja-jp-nanami:DragonHDLatestNeural"),
         "endpoint": os.getenv("AZURE_VOICELIVE_ENDPOINT", ""),
         "apiKey": os.getenv("AZURE_VOICELIVE_API_KEY", ""),
