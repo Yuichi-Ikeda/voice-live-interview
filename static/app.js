@@ -200,7 +200,7 @@ function updateConditionalFields() {
     const srModel = document.getElementById('srModel').value;
 
     // Cascaded models
-    const cascadedModels = ['gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4o', 'gpt-4o-mini', 'phi4-mm', 'phi4-mini'];
+    const cascadedModels = ['gpt-5.2', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4o', 'gpt-4o-mini', 'phi4-mm', 'phi4-mini'];
     const isCascaded = cascadedModels.includes(model);
     const isRealtime = model && model.includes('realtime');
 
