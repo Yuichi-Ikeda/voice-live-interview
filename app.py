@@ -9,7 +9,9 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Dict
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Optional
 
 import uvicorn
 from azure.core.credentials import AzureKeyCredential
@@ -18,6 +20,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from voice_handler import VoiceSessionHandler
 
@@ -56,6 +59,22 @@ logging.basicConfig(
     handlers=[handler],
 )
 logger = logging.getLogger(__name__)
+logs_dir = Path(__file__).resolve().parent / "logs"
+
+
+class ConversationLogMessage(BaseModel):
+    role: str
+    text: str
+    timestamp: str
+
+
+class ConversationLogPayload(BaseModel):
+    clientId: str
+    sessionId: Optional[str] = None
+    developerMode: bool = True
+    disconnectReason: Optional[str] = None
+    savedAt: Optional[str] = None
+    messages: list[ConversationLogMessage]
 
 # Track active sessions per client
 active_sessions: Dict[str, VoiceSessionHandler] = {}
@@ -124,6 +143,64 @@ async def get_config():
         "endpoint": os.getenv("AZURE_VOICELIVE_ENDPOINT", ""),
         "apiKey": os.getenv("AZURE_VOICELIVE_API_KEY", ""),
         "instructions": instructions,
+    }
+
+
+def _build_log_file_path() -> Path:
+    """Build a timestamp-based log file path under ./logs."""
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    base_name = datetime.now().strftime("%Y-%m-%d-%H_%M_%S")
+    candidate = logs_dir / f"{base_name}.json"
+    suffix = 1
+    while candidate.exists():
+        candidate = logs_dir / f"{base_name}_{suffix:02d}.json"
+        suffix += 1
+    return candidate
+
+
+def _sanitize_log_text(text: str) -> str:
+    """Remove newline characters and trim whitespace before persisting logs."""
+    return text.replace("\r", " ").replace("\n", " ").strip()
+
+
+@app.post("/api/logs/conversation")
+async def save_conversation_log(payload: ConversationLogPayload):
+    """Persist conversation messages as JSON."""
+    messages = [
+        {
+            "role": message.role,
+            "text": _sanitize_log_text(message.text),
+            "timestamp": message.timestamp,
+        }
+        for message in payload.messages
+        if message.role in {"user", "assistant"} and _sanitize_log_text(message.text)
+    ]
+
+    if not messages:
+        return {
+            "saved": False,
+            "reason": "skipped",
+        }
+
+    file_path = _build_log_file_path()
+    document = {
+        "clientId": payload.clientId,
+        "sessionId": payload.sessionId,
+        "developerMode": payload.developerMode,
+        "disconnectReason": payload.disconnectReason,
+        "savedAt": payload.savedAt or datetime.utcnow().isoformat() + "Z",
+        "messages": messages,
+    }
+
+    file_path.write_text(
+        json.dumps(document, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    logger.info(f"Saved developer conversation log: {file_path.name}")
+    return {
+        "saved": True,
+        "filename": file_path.name,
+        "path": str(file_path.relative_to(Path(__file__).resolve().parent)),
     }
 
 

@@ -24,6 +24,11 @@ let isSpeaking = false;
 let avatarOutputMode = 'webrtc';
 let cachedIceServers = null;
 let peerConnectionQueue = [];
+let conversationLog = [];
+let conversationLogSequence = 0;
+let activeSessionId = null;
+let sessionConversationLoggingEnabled = false;
+let disconnectPromise = null;
 
 // Volume animation state
 let analyserNode = null;
@@ -257,12 +262,13 @@ function toggleSidebar() {
 
 // ===== Chat =====
 function addMessage(role, text, isDev = false) {
-    if (isDev && !isDeveloperMode) return;
+    const options = typeof isDev === 'boolean' ? { isDev } : (isDev || {});
+    if (options.isDev && !isDeveloperMode) return null;
     const messagesEl = document.getElementById('messages');
     const msgDiv = document.createElement('div');
-    msgDiv.className = `message ${isDev ? 'dev' : role}`;
+    msgDiv.className = `message ${options.isDev ? 'dev' : role}`;
 
-    if (!isDev) {
+    if (!options.isDev) {
         const roleSpan = document.createElement('div');
         roleSpan.className = 'message-role';
         roleSpan.textContent = role === 'user' ? 'You' : role === 'assistant' ? 'Assistant' : 'System';
@@ -274,10 +280,115 @@ function addMessage(role, text, isDev = false) {
     contentDiv.textContent = text;
     msgDiv.appendChild(contentDiv);
 
+    if (options.itemId) {
+        msgDiv.setAttribute('data-item-id', options.itemId);
+    }
+
     messagesEl.appendChild(msgDiv);
     scrollChatToBottom();
     updateClearChatButton();
+
+    if (options.trackConversation) {
+        upsertConversationMessage({
+            role,
+            text,
+            itemId: options.itemId,
+            final: options.final !== false,
+            source: options.source || 'unknown',
+        });
+    }
+
     return contentDiv;
+}
+
+function sanitizeConversationText(text) {
+    if (typeof text !== 'string') return '';
+    return text.replace(/[\r\n]+/g, '').trim();
+}
+
+function upsertConversationMessage({ role, text, itemId = null, final = true, source = 'unknown' }) {
+    if (role !== 'user' && role !== 'assistant') return null;
+
+    const normalizedText = sanitizeConversationText(text);
+    const timestamp = new Date().toISOString();
+    let entry = null;
+
+    if (itemId) {
+        entry = conversationLog.find((message) => message.itemId === itemId);
+    }
+
+    if (entry) {
+        entry.text = normalizedText;
+        entry.final = final;
+        entry.source = source;
+        entry.timestamp = timestamp;
+        return entry;
+    }
+
+    entry = {
+        id: ++conversationLogSequence,
+        role,
+        text: normalizedText,
+        itemId,
+        final,
+        source,
+        timestamp,
+    };
+    conversationLog.push(entry);
+    return entry;
+}
+
+function getConversationMessagesForExport() {
+    return conversationLog
+        .filter((message) => message.final && (message.role === 'user' || message.role === 'assistant'))
+        .filter((message) => message.text)
+        .map(({ role, text, timestamp }) => ({
+            role,
+            text,
+            timestamp,
+        }));
+}
+
+function resetConversationMessages() {
+    conversationLog = [];
+    conversationLogSequence = 0;
+}
+
+function startConversationCaptureSession(sessionId) {
+    activeSessionId = sessionId || null;
+    sessionConversationLoggingEnabled = true;
+    resetConversationMessages();
+}
+
+async function persistConversationLog(disconnectReason) {
+    if (!sessionConversationLoggingEnabled) return;
+
+    const messages = getConversationMessagesForExport();
+    if (messages.length === 0) return;
+
+    const response = await fetch('/api/logs/conversation', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            clientId,
+            sessionId: activeSessionId,
+            developerMode: isDeveloperMode,
+            disconnectReason,
+            savedAt: new Date().toISOString(),
+            messages,
+        }),
+    });
+
+    if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+    }
+
+    const result = await response.json();
+    if (result.saved) {
+        console.log('Saved developer conversation log to', result.path || result.filename);
+    }
 }
 
 function updateLastAssistantMessage(text) {
@@ -297,6 +408,7 @@ function clearChat() {
     const messages = document.getElementById('messages');
     if (messages.children.length === 0) return;
     messages.innerHTML = '';
+    resetConversationMessages();
     updateClearChatButton();
 }
 
@@ -441,7 +553,7 @@ async function connectSession() {
             if (isConnected) {
                 addMessage('system', 'Disconnected');
             }
-            handleDisconnect();
+            handleDisconnect('socket_closed');
         };
 
     } catch (err) {
@@ -452,13 +564,43 @@ async function connectSession() {
 }
 
 async function disconnect() {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'stop_session' }));
-    }
-    handleDisconnect();
+    await shutdownSession('manual_disconnect');
 }
 
-function handleDisconnect() {
+async function shutdownSession(reason) {
+    if (disconnectPromise) {
+        return disconnectPromise;
+    }
+
+    disconnectPromise = (async () => {
+        const socket = ws;
+
+        if (reason === 'manual_disconnect' && socket && socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ type: 'stop_session' }));
+        }
+
+        try {
+            await persistConversationLog(reason);
+        } catch (error) {
+            console.error('Failed to save developer conversation log', error);
+            addMessage('system', 'Failed to save developer conversation log: ' + error.message);
+        }
+
+        finalizeDisconnect();
+    })();
+
+    try {
+        await disconnectPromise;
+    } finally {
+        disconnectPromise = null;
+    }
+}
+
+function handleDisconnect(reason = 'socket_closed') {
+    void shutdownSession(reason);
+}
+
+function finalizeDisconnect() {
     isConnected = false;
     isConnecting = false;
     isRecording = false;
@@ -477,10 +619,17 @@ function handleDisconnect() {
     }
 
     if (ws) {
-        try { ws.close(); } catch (e) {}
+        try {
+            ws.onclose = null;
+            ws.onerror = null;
+            ws.onmessage = null;
+            ws.close();
+        } catch (e) {}
         ws = null;
     }
 
+    activeSessionId = null;
+    sessionConversationLoggingEnabled = false;
     updateConnectionUI();
     updateDeveloperModeLayout();
 }
@@ -517,15 +666,29 @@ function handleServerMessage(msg) {
                     const existing = document.querySelector(`.message.user[data-item-id="${itemId}"] .message-content`);
                     if (existing) {
                         existing.textContent = msg.transcript;
+                        upsertConversationMessage({
+                            role: 'user',
+                            text: msg.transcript,
+                            itemId,
+                            final: true,
+                            source: 'speech',
+                        });
                         scrollChatToBottom();
                         break;
                     }
                 }
-                addMessage('user', msg.transcript);
+                addMessage('user', msg.transcript, {
+                    trackConversation: true,
+                    itemId,
+                    source: 'speech',
+                });
             } else if (msg.role === 'assistant') {
                 // Show complete transcript only after audio generation is done
                 if (msg.transcript) {
-                    addMessage('assistant', msg.transcript);
+                    addMessage('assistant', msg.transcript, {
+                        trackConversation: true,
+                        source: 'speech',
+                    });
                     pendingAssistantText = '';
                 }
             }
@@ -557,7 +720,7 @@ function handleServerMessage(msg) {
             break;
         case 'session_closed':
             addMessage('system', 'Session closed');
-            handleDisconnect();
+            handleDisconnect('session_closed');
             break;
         case 'avatar_connecting':
             addMessage('system', 'Avatar connecting...');
@@ -590,6 +753,7 @@ function onAssistantDelta(text) {
 async function onSessionStarted(msg) {
     isConnected = true;
     isConnecting = false;
+    startConversationCaptureSession(msg.sessionId || null);
     updateConnectionUI();
 
     // Update the "connecting..." status message with the real session ID
@@ -1453,7 +1617,10 @@ function sendTextMessage() {
     const text = input.value.trim();
     if (!text || !isConnected || !ws) return;
 
-    addMessage('user', text);
+    addMessage('user', text, {
+        trackConversation: true,
+        source: 'text',
+    });
     ws.send(JSON.stringify({ type: 'send_text', text }));
     input.value = '';
 }
@@ -1465,7 +1632,12 @@ function onSpeechStarted(itemId) {
     stopAudioPlayback();
     // Add user placeholder message (will be updated when transcription completes)
     if (itemId) {
-        const contentDiv = addMessage('user', '...');
+        const contentDiv = addMessage('user', '...', {
+            trackConversation: true,
+            itemId,
+            final: false,
+            source: 'speech',
+        });
         if (contentDiv) {
             contentDiv.closest('.message').setAttribute('data-item-id', itemId);
         }

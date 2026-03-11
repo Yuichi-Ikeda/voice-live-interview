@@ -1,3 +1,4 @@
 /.env
 /README_EN.md
 /__pycache__
+/logs/
