@@ -16,7 +16,7 @@ from typing import Dict, Optional
 import uvicorn
 from azure.core.credentials import AzureKeyCredential
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
@@ -74,6 +74,7 @@ class ConversationLogPayload(BaseModel):
     developerMode: bool = True
     disconnectReason: Optional[str] = None
     savedAt: Optional[str] = None
+    logBasename: Optional[str] = None
     messages: list[ConversationLogMessage]
 
 # Track active sessions per client
@@ -146,14 +147,29 @@ async def get_config():
     }
 
 
-def _build_log_file_path() -> Path:
+import re as _re
+
+_LOG_BASENAME_RE = _re.compile(r"^[\w\-]+$")
+
+
+def _sanitize_log_basename(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    cleaned = raw.strip()[:64]
+    return cleaned if _LOG_BASENAME_RE.match(cleaned) else None
+
+
+def _build_log_file_path(
+    extension: str = ".json",
+    preferred_base_name: Optional[str] = None,
+) -> Path:
     """Build a timestamp-based log file path under ./logs."""
     logs_dir.mkdir(parents=True, exist_ok=True)
-    base_name = datetime.now().strftime("%Y-%m-%d-%H_%M_%S")
-    candidate = logs_dir / f"{base_name}.json"
+    base_name = preferred_base_name or datetime.now().strftime("%Y-%m-%d-%H_%M_%S")
+    candidate = logs_dir / f"{base_name}{extension}"
     suffix = 1
     while candidate.exists():
-        candidate = logs_dir / f"{base_name}_{suffix:02d}.json"
+        candidate = logs_dir / f"{base_name}_{suffix:02d}{extension}"
         suffix += 1
     return candidate
 
@@ -182,7 +198,7 @@ async def save_conversation_log(payload: ConversationLogPayload):
             "reason": "skipped",
         }
 
-    file_path = _build_log_file_path()
+    file_path = _build_log_file_path(".json", _sanitize_log_basename(payload.logBasename))
     document = {
         "clientId": payload.clientId,
         "sessionId": payload.sessionId,
@@ -197,6 +213,23 @@ async def save_conversation_log(payload: ConversationLogPayload):
         encoding="utf-8",
     )
     logger.info(f"Saved developer conversation log: {file_path.name}")
+    return {
+        "saved": True,
+        "filename": file_path.name,
+        "path": str(file_path.relative_to(Path(__file__).resolve().parent)),
+    }
+
+
+@app.post("/api/logs/audio")
+async def save_audio_log(request: Request):
+    """Persist a WAV recording uploaded as raw body."""
+    body = await request.body()
+    if len(body) < 44:
+        return {"saved": False, "reason": "empty"}
+    basename = _sanitize_log_basename(request.headers.get("x-log-basename"))
+    file_path = _build_log_file_path(".wav", basename)
+    file_path.write_bytes(body)
+    logger.info(f"Saved audio log: {file_path.name}")
     return {
         "saved": True,
         "filename": file_path.name,

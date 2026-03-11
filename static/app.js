@@ -30,6 +30,14 @@ let activeSessionId = null;
 let sessionConversationLoggingEnabled = false;
 let disconnectPromise = null;
 
+// WAV recording state
+let wavRecordingEnabled = false;
+let micPcmChunks = [];
+let assistantPcmChunks = [];
+let wavLogBaseName = null;
+let webrtcCaptureCtx = null;
+let webrtcCaptureScript = null;
+
 // Volume animation state
 let analyserNode = null;
 let analyserDataArray = null;
@@ -358,6 +366,150 @@ function startConversationCaptureSession(sessionId) {
     activeSessionId = sessionId || null;
     sessionConversationLoggingEnabled = true;
     resetConversationMessages();
+    resetWavRecorder();
+}
+
+// ===== WAV Recording =====
+function buildLogBaseName() {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}_${pad(d.getMinutes())}_${pad(d.getSeconds())}`;
+}
+
+function resetWavRecorder() {
+    wavRecordingEnabled = document.getElementById('saveWavLog')?.checked ?? false;
+    micPcmChunks = [];
+    assistantPcmChunks = [];
+    wavLogBaseName = null;
+}
+
+function appendMicChunk(arrayBuffer) {
+    if (!wavRecordingEnabled) return;
+    micPcmChunks.push(new Int16Array(arrayBuffer.slice(0)));
+}
+
+function appendAssistantChunk(arrayBuffer) {
+    if (!wavRecordingEnabled) return;
+    assistantPcmChunks.push(new Int16Array(arrayBuffer));
+}
+
+function startWebRTCAudioCapture(mediaStream) {
+    if (!wavRecordingEnabled) return;
+    stopWebRTCAudioCapture();
+    try {
+        const ctx = new AudioContext({ sampleRate: 24000 });
+        const source = ctx.createMediaStreamSource(mediaStream);
+        // ScriptProcessorNode: captures PCM at context sample rate
+        const script = ctx.createScriptProcessor(4096, 1, 1);
+        script.onaudioprocess = (e) => {
+            if (!wavRecordingEnabled) return;
+            const float32 = e.inputBuffer.getChannelData(0);
+            const int16 = new Int16Array(float32.length);
+            for (let j = 0; j < float32.length; j++) {
+                int16[j] = Math.max(-32768, Math.min(32767, Math.round(float32[j] * 32768)));
+            }
+            assistantPcmChunks.push(int16);
+        };
+        source.connect(script);
+        script.connect(ctx.destination);
+        webrtcCaptureCtx = ctx;
+        webrtcCaptureScript = script;
+        console.log('[WAV] WebRTC audio capture started (24kHz)');
+    } catch (err) {
+        console.error('[WAV] Failed to start WebRTC audio capture', err);
+    }
+}
+
+function stopWebRTCAudioCapture() {
+    if (webrtcCaptureScript) { try { webrtcCaptureScript.disconnect(); } catch (e) {} webrtcCaptureScript = null; }
+    if (webrtcCaptureCtx) { try { webrtcCaptureCtx.close(); } catch (e) {} webrtcCaptureCtx = null; }
+}
+
+function flattenPcmChunks(chunks) {
+    let totalLen = 0;
+    for (const c of chunks) totalLen += c.length;
+    const out = new Int16Array(totalLen);
+    let offset = 0;
+    for (const c of chunks) { out.set(c, offset); offset += c.length; }
+    return out;
+}
+
+function buildStereoWavBlob() {
+    const userSamples = flattenPcmChunks(micPcmChunks);
+    const assistantSamples = flattenPcmChunks(assistantPcmChunks);
+    console.log(`[WAV] Building stereo WAV: user=${userSamples.length} samples (${micPcmChunks.length} chunks), assistant=${assistantSamples.length} samples (${assistantPcmChunks.length} chunks)`);
+    const maxLen = Math.max(userSamples.length, assistantSamples.length);
+    if (maxLen === 0) return null;
+
+    const numChannels = 2;
+    const sampleRate = 24000;
+    const bitsPerSample = 16;
+    const bytesPerSample = bitsPerSample / 8;
+    const blockAlign = numChannels * bytesPerSample;
+    const dataSize = maxLen * blockAlign;
+    const buffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buffer);
+
+    // RIFF header
+    writeString(view, 0, 'RIFF');
+    view.setUint32(4, 36 + dataSize, true);
+    writeString(view, 8, 'WAVE');
+    // fmt
+    writeString(view, 12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);           // PCM
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * blockAlign, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, bitsPerSample, true);
+    // data
+    writeString(view, 36, 'data');
+    view.setUint32(40, dataSize, true);
+
+    let pos = 44;
+    for (let i = 0; i < maxLen; i++) {
+        const userVal = i < userSamples.length ? userSamples[i] : 0;
+        const assistantVal = i < assistantSamples.length ? assistantSamples[i] : 0;
+        view.setInt16(pos, userVal, true);       // L = user
+        view.setInt16(pos + 2, assistantVal, true); // R = assistant
+        pos += 4;
+    }
+
+    return new Blob([buffer], { type: 'audio/wav' });
+}
+
+function writeString(view, offset, str) {
+    for (let i = 0; i < str.length; i++) {
+        view.setUint8(offset + i, str.charCodeAt(i));
+    }
+}
+
+async function persistConversationWav() {
+    if (!wavRecordingEnabled) return;
+    if (micPcmChunks.length === 0 && assistantPcmChunks.length === 0) return;
+
+    const blob = buildStereoWavBlob();
+    if (!blob) return;
+
+    try {
+        const response = await fetch('/api/logs/audio', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/octet-stream',
+                'X-Log-Basename': wavLogBaseName || '',
+            },
+            body: blob,
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const result = await response.json();
+        if (result.saved) {
+            console.log('Saved WAV recording to', result.path || result.filename);
+        }
+    } catch (err) {
+        console.error('Failed to save WAV recording', err);
+        addMessage('system', 'Failed to save WAV recording: ' + err.message);
+    }
 }
 
 async function persistConversationLog(disconnectReason) {
@@ -377,6 +529,7 @@ async function persistConversationLog(disconnectReason) {
             developerMode: isDeveloperMode,
             disconnectReason,
             savedAt: new Date().toISOString(),
+            logBasename: wavLogBaseName || undefined,
             messages,
         }),
     });
@@ -462,6 +615,7 @@ function gatherConfig() {
         instructions: document.getElementById('instructions').value,
         temperature: parseFloat(document.getElementById('temperature').value),
         enableProactive: document.getElementById('enableProactive').checked,
+        saveWavLog: document.getElementById('saveWavLog').checked,
         // Agent fields
         agentId: document.getElementById('agentId').value,
         agentName: document.getElementById('agentName').value,
@@ -579,11 +733,21 @@ async function shutdownSession(reason) {
             socket.send(JSON.stringify({ type: 'stop_session' }));
         }
 
+        // Generate shared basename for both JSON and WAV
+        wavLogBaseName = buildLogBaseName();
+
         try {
             await persistConversationLog(reason);
         } catch (error) {
             console.error('Failed to save developer conversation log', error);
             addMessage('system', 'Failed to save developer conversation log: ' + error.message);
+        }
+
+        try {
+            await persistConversationWav();
+        } catch (error) {
+            console.error('Failed to save WAV recording', error);
+            addMessage('system', 'Failed to save WAV recording: ' + error.message);
         }
 
         finalizeDisconnect();
@@ -630,6 +794,10 @@ function finalizeDisconnect() {
 
     activeSessionId = null;
     sessionConversationLoggingEnabled = false;
+    micPcmChunks = [];
+    assistantPcmChunks = [];
+    wavRecordingEnabled = false;
+    stopWebRTCAudioCapture();
     updateConnectionUI();
     updateDeveloperModeLayout();
 }
@@ -838,7 +1006,7 @@ const SETTINGS_CONTROLS = [
     // Conversation Settings
     'srModel', 'recognitionLanguage',
     'useNS', 'useEC', 'turnDetectionType', 'removeFillerWords',
-    'eouDetectionType', 'instructions', 'enableProactive',
+    'eouDetectionType', 'instructions', 'enableProactive', 'saveWavLog',
     'temperature', 'voiceTemperature', 'voiceSpeed',
     // Voice Configuration
     'voiceType', 'voiceDeploymentId', 'customVoiceName',
@@ -1075,6 +1243,7 @@ registerProcessor('pcm16-processor', PCM16Processor);
 
         workletNode.port.onmessage = (e) => {
             if (!isConnected || !isRecording || !ws || ws.readyState !== WebSocket.OPEN) return;
+            appendMicChunk(e.data);
             const base64 = arrayBufferToBase64(e.data);
             audioChunksSent++;
             if (audioChunksSent <= 3 || audioChunksSent % 100 === 0) {
@@ -1125,6 +1294,7 @@ function handleAudioDelta(base64Data) {
         nextPlaybackTime = 0;
     }
     const arrayBuffer = base64ToArrayBuffer(base64Data);
+    appendAssistantChunk(arrayBuffer);
     const int16 = new Int16Array(arrayBuffer);
     const float32 = new Float32Array(int16.length);
     for (let i = 0; i < int16.length; i++) {
@@ -1392,6 +1562,9 @@ function preparePeerConnection(iceServers) {
                 }, 0);
             };
         }
+        if (event.track.kind === 'audio' && event.streams[0]) {
+            startWebRTCAudioCapture(event.streams[0]);
+        }
     };
 
     pc.onicegatheringstatechange = () => {
@@ -1505,6 +1678,9 @@ function setupWebRTC(iceServers) {
                     mediaPlayer.style.height = '';
                 }, 0);
             };
+        }
+        if (event.track.kind === 'audio' && event.streams[0]) {
+            startWebRTCAudioCapture(event.streams[0]);
         }
     };
 
